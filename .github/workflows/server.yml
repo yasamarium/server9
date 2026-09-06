@@ -1,0 +1,92 @@
+name: AS Cloud - SERVER9 (DeepSeek-R1 1.5B (Reasoning))
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  repository_dispatch:
+    types: [retrigger-server]
+  schedule:
+    - cron: '0 */6 * * *'
+
+concurrency:
+  group: server9-singleton
+  cancel-in-progress: false
+
+jobs:
+  serve:
+    name: Run deepseek-r1-1.5b
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    timeout-minutes: 350
+
+    env:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      MODEL_NAME: "deepseek-r1-1.5b"
+      MODEL_FILE: "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf"
+      MODEL_PATH: "models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf"
+      MODEL_URL: "https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf"
+      CONTEXT_SIZE: "4096"
+      THREADS: "2"
+      BATCH_SIZE: "512"
+      MAX_TOKENS: "512"
+      TEMPERATURE: "0.7"
+      RESTART_INTERVAL_SECONDS: "18000"
+      RUN_SINGLE_CYCLE: "true"
+      API_KEY: ${{ secrets.API_KEY || 'qwen3-direct-access' }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Install System Dependencies & Cloudflared
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl build-essential libgomp1
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm cloudflared.deb
+
+      - name: 4. Install Python Dependencies & llama-cpp-python CPU Wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu || pip install llama-cpp-python
+
+      - name: 5. Cache Model Weights (Optimistic)
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/
+          key: model-server9-v1-${{ hashFiles('scripts/download_model.py') }}
+          restore-keys: |
+            model-server9-v1-
+
+      - name: 6. Download Model
+        run: |
+          python scripts/download_model.py
+
+      - name: 7. Run Automated Tests
+        run: |
+          MOCK_MODEL=true pytest tests/test_api.py -v
+
+      - name: 8. Start Server & Public Tunnel (~5-Hour Active Session)
+        run: |
+          chmod +x scripts/start_server.sh
+          ./scripts/start_server.sh
+
+      - name: 9. Safe Workflow Retrigger
+        if: always() && steps.cache-model.outcome != 'failure'
+        run: |
+          python scripts/retrigger_workflow.py
